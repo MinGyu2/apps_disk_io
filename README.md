@@ -14,7 +14,7 @@ cd apps_disk_io
 cargo build --release
 ```
 
-eBPF 오브젝트 빌드에는 clang과 clang의 BPF target 지원이 필요할 수 있습니다. 해당 환경이 없으면 기본 모드는 사용할 수 있지만 eBPF 기반 detail 이벤트 수집은 사용할 수 없습니다.
+eBPF 오브젝트 빌드에는 clang과 clang의 BPF target 지원이 필요할 수 있습니다. Debian/Ubuntu 계열에서는 `/usr/include/<triple>` multiarch 헤더 경로가 필요할 수 있습니다. 해당 환경이 없으면 기본 모드는 사용할 수 있지만 eBPF 기반 detail 이벤트 수집은 사용할 수 없습니다.
 
 ## 실행
 
