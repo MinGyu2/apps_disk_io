@@ -144,6 +144,8 @@ impl Drop for FileIoEventSource {
 }
 
 fn attach_syscall_tracepoints(ebpf: &mut Ebpf) -> Result<(), String> {
+    // TODO: Add matching eBPF programs/probes for preadv/pwritev variants,
+    // copy_file_range, sendfile, io_uring, and mmap-based I/O.
     for syscall in ["read", "write", "pread64", "pwrite64", "readv", "writev"] {
         attach_tracepoint(
             ebpf,

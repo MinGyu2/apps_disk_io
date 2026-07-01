@@ -1,6 +1,6 @@
 pub mod detail;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -31,11 +31,16 @@ struct Cli {
     )]
     interval: u64,
 
+    /// 프로세스 정렬 기준
+    #[arg(long, value_enum, default_value = "current")]
+    sort: SortMode,
+
     /// 종료된 프로세스를 화면에 유지할 시간(초)
     #[arg(
         long,
         value_name = "SECONDS",
-        default_value_t = DEFAULT_RETAIN_EXITED_SECONDS
+        default_value_t = DEFAULT_RETAIN_EXITED_SECONDS,
+        value_parser = parse_retain_exited
     )]
     retain_exited: u64,
 
@@ -48,16 +53,28 @@ struct Cli {
     fd: bool,
 
     /// detail 모드에서 프로세스당 표시할 최대 파일 수
-    #[arg(long, value_name = "COUNT", default_value_t = DEFAULT_DETAIL_LIMIT)]
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = DEFAULT_DETAIL_LIMIT,
+        value_parser = parse_detail_limit
+    )]
     detail_limit: usize,
 
     /// 마지막 I/O 후 파일별 통계를 유지할 시간(초)
     #[arg(
         long,
         value_name = "SECONDS",
-        default_value_t = DEFAULT_DETAIL_RETAIN_SECONDS
+        default_value_t = DEFAULT_DETAIL_RETAIN_SECONDS,
+        value_parser = parse_detail_retain
     )]
     detail_retain: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SortMode {
+    Current,
+    Cumulative,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +109,36 @@ fn parse_interval(value: &str) -> Result<u64, String> {
     }
 
     Ok(milliseconds)
+}
+
+fn parse_retain_exited(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("유효하지 않은 retain-exited '{value}': 0 이상의 정수를 입력하세요"))
+}
+
+fn parse_detail_limit(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| format!("유효하지 않은 detail-limit '{value}': 0보다 큰 정수를 입력하세요"))?;
+
+    if limit == 0 {
+        return Err("유효하지 않은 detail-limit '0': 0보다 큰 정수를 입력하세요".to_string());
+    }
+
+    Ok(limit)
+}
+
+fn parse_detail_retain(value: &str) -> Result<u64, String> {
+    let seconds = value.parse::<u64>().map_err(|_| {
+        format!("유효하지 않은 detail-retain '{value}': 0보다 큰 정수를 입력하세요")
+    })?;
+
+    if seconds == 0 {
+        return Err("유효하지 않은 detail-retain '0': 0보다 큰 정수를 입력하세요".to_string());
+    }
+
+    Ok(seconds)
 }
 
 /// `/proc/<pid>/io`에서 실제 스토리지 계층까지 전달된 누적 바이트를 읽는다.
@@ -255,17 +302,22 @@ fn calculate_rates(
     });
 }
 
-fn stats_for_display(stats: &HashMap<u32, ProcessStats>) -> Vec<&ProcessStats> {
+fn stats_for_display(
+    stats: &HashMap<u32, ProcessStats>,
+    sort_mode: SortMode,
+) -> Vec<&ProcessStats> {
     let mut processes: Vec<_> = stats
         .values()
         .filter(|process_stats| process_stats.cumulative_total > 0)
         .collect();
 
     processes.sort_unstable_by(|left, right| {
-        right
-            .cumulative_total
-            .cmp(&left.cumulative_total)
-            .then_with(|| left.pid.cmp(&right.pid))
+        let ordering = match sort_mode {
+            SortMode::Current => right.total_bps.total_cmp(&left.total_bps),
+            SortMode::Cumulative => right.cumulative_total.cmp(&left.cumulative_total),
+        };
+
+        ordering.then_with(|| left.pid.cmp(&right.pid))
     });
     processes.truncate(MAX_PROCESSES);
     processes
@@ -505,6 +557,7 @@ fn sanitize_for_terminal(value: &str) -> String {
 
 fn run(
     interval: Duration,
+    sort_mode: SortMode,
     retain_exited: Duration,
     detail_enabled: bool,
     show_open_fds: bool,
@@ -559,7 +612,7 @@ fn run(
             sampled_at,
             retain_exited,
         );
-        let processes = stats_for_display(&stats);
+        let processes = stats_for_display(&stats, sort_mode);
         let open_fds = show_open_fds.then(|| {
             detail::collect_fallback_details(
                 processes
@@ -594,6 +647,7 @@ fn main() -> ExitCode {
 
     match run(
         interval,
+        cli.sort,
         retain_exited,
         cli.detail,
         cli.fd,
@@ -658,6 +712,22 @@ mod tests {
         }
     }
 
+    fn sortable_process_stats(pid: u32, total_bps: f64, cumulative_total: u64) -> ProcessStats {
+        ProcessStats {
+            pid,
+            name: format!("process-{pid}"),
+            read_bps: total_bps,
+            write_bps: 0.0,
+            total_bps,
+            cumulative_read: cumulative_total,
+            cumulative_write: 0,
+            cumulative_total,
+            last_seen: Instant::now(),
+            last_io_at: Some(Instant::now()),
+            exited: false,
+        }
+    }
+
     fn render_accumulated_file_io(accumulator: &detail::FileIoAccumulator) -> String {
         let mut output = Vec::new();
 
@@ -682,6 +752,16 @@ mod tests {
         assert_eq!(parse_interval("1000"), Ok(1000));
         assert!(parse_interval("0").is_err());
         assert!(parse_interval("abc").is_err());
+    }
+
+    #[test]
+    fn numeric_option_parsers_enforce_bounds() {
+        assert_eq!(parse_retain_exited("0"), Ok(0));
+        assert!(parse_retain_exited("-1").is_err());
+        assert_eq!(parse_detail_limit("1"), Ok(1));
+        assert!(parse_detail_limit("0").is_err());
+        assert_eq!(parse_detail_retain("1"), Ok(1));
+        assert!(parse_detail_retain("0").is_err());
     }
 
     #[test]
@@ -717,7 +797,7 @@ mod tests {
         let process_stats = stats.get(&10).unwrap();
         assert_eq!(process_stats.total_bps, 0.0);
         assert_eq!(process_stats.cumulative_total, 3_000);
-        assert_eq!(stats_for_display(&stats)[0].pid, 10);
+        assert_eq!(stats_for_display(&stats, SortMode::Current)[0].pid, 10);
     }
 
     #[test]
@@ -736,7 +816,7 @@ mod tests {
         );
 
         assert!(stats.contains_key(&10));
-        assert!(stats_for_display(&stats).is_empty());
+        assert!(stats_for_display(&stats, SortMode::Current).is_empty());
     }
 
     #[test]
@@ -805,27 +885,43 @@ mod tests {
     }
 
     #[test]
-    fn processes_are_sorted_by_cumulative_total() {
-        let sampled_at = Instant::now();
-        let previous = HashMap::from([(10, sample("small", 0, 0)), (20, sample("large", 0, 0))]);
-        let current = HashMap::from([
-            (10, sample("small", 100, 50)),
-            (20, sample("large", 200, 300)),
+    fn current_sort_uses_total_bps() {
+        let stats = HashMap::from([
+            (10, sortable_process_stats(10, 500.0, 100)),
+            (20, sortable_process_stats(20, 100.0, 1_000)),
         ]);
-        let mut stats = HashMap::new();
 
-        calculate_rates(
-            &previous,
-            &current,
-            1.0,
-            &mut stats,
-            sampled_at,
-            Duration::from_secs(30),
-        );
+        let processes = stats_for_display(&stats, SortMode::Current);
 
-        let processes = stats_for_display(&stats);
+        assert_eq!(processes[0].pid, 10);
+        assert_eq!(processes[1].pid, 20);
+    }
+
+    #[test]
+    fn cumulative_sort_uses_cumulative_total() {
+        let stats = HashMap::from([
+            (10, sortable_process_stats(10, 500.0, 100)),
+            (20, sortable_process_stats(20, 100.0, 1_000)),
+        ]);
+
+        let processes = stats_for_display(&stats, SortMode::Cumulative);
+
         assert_eq!(processes[0].pid, 20);
         assert_eq!(processes[1].pid, 10);
+    }
+
+    #[test]
+    fn sort_ties_are_broken_by_pid() {
+        let stats = HashMap::from([
+            (20, sortable_process_stats(20, 100.0, 1_000)),
+            (10, sortable_process_stats(10, 100.0, 1_000)),
+        ]);
+
+        for sort_mode in [SortMode::Current, SortMode::Cumulative] {
+            let processes = stats_for_display(&stats, sort_mode);
+            assert_eq!(processes[0].pid, 10);
+            assert_eq!(processes[1].pid, 20);
+        }
     }
 
     #[test]
@@ -1056,11 +1152,29 @@ mod tests {
                 .unwrap();
 
         assert_eq!(cli.interval, 500);
+        assert_eq!(cli.sort, SortMode::Current);
         assert_eq!(cli.retain_exited, 60);
         assert!(!cli.detail);
         assert!(!cli.fd);
         assert_eq!(cli.detail_limit, DEFAULT_DETAIL_LIMIT);
         assert_eq!(cli.detail_retain, DEFAULT_DETAIL_RETAIN_SECONDS);
+    }
+
+    #[test]
+    fn parses_current_sort_option() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "current"]).unwrap();
+        assert_eq!(cli.sort, SortMode::Current);
+    }
+
+    #[test]
+    fn parses_cumulative_sort_option() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "cumulative"]).unwrap();
+        assert_eq!(cli.sort, SortMode::Cumulative);
+    }
+
+    #[test]
+    fn invalid_sort_value_is_rejected() {
+        assert!(Cli::try_parse_from(["apps_disk_io", "--sort", "invalid"]).is_err());
     }
 
     #[test]
@@ -1085,5 +1199,15 @@ mod tests {
     #[test]
     fn fd_option_requires_detail() {
         assert!(Cli::try_parse_from(["apps_disk_io", "--fd"]).is_err());
+    }
+
+    #[test]
+    fn zero_detail_limit_is_rejected() {
+        assert!(Cli::try_parse_from(["apps_disk_io", "--detail-limit", "0"]).is_err());
+    }
+
+    #[test]
+    fn zero_detail_retain_is_rejected() {
+        assert!(Cli::try_parse_from(["apps_disk_io", "--detail-retain", "0"]).is_err());
     }
 }
