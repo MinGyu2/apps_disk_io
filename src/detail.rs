@@ -65,10 +65,10 @@ impl FileIoStats {
 
     pub fn operation_label(&self) -> &'static str {
         match (self.read_bytes_interval > 0, self.write_bytes_interval > 0) {
-            (true, true) => "read/write",
-            (true, false) => "read",
-            (false, true) => "write",
-            (false, false) => "idle",
+            (true, true) => "r,w",
+            (true, false) => "r",
+            (false, true) => "w",
+            (false, false) => "-",
         }
     }
 }
@@ -217,6 +217,36 @@ mod tests {
         }
     }
 
+    fn file_stats(read_bytes_interval: u64, write_bytes_interval: u64) -> FileIoStats {
+        FileIoStats {
+            pid: 10,
+            process_start_time: 99,
+            fd: 3,
+            path: "/tmp/data".into(),
+            read_bytes_interval,
+            write_bytes_interval,
+            cumulative_read: read_bytes_interval,
+            cumulative_write: write_bytes_interval,
+            cumulative_total: read_bytes_interval.saturating_add(write_bytes_interval),
+            last_io_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn read_only_operation_uses_short_label() {
+        assert_eq!(file_stats(100, 0).operation_label(), "r");
+    }
+
+    #[test]
+    fn write_only_operation_uses_short_label() {
+        assert_eq!(file_stats(0, 100).operation_label(), "w");
+    }
+
+    #[test]
+    fn mixed_operation_uses_short_label() {
+        assert_eq!(file_stats(100, 100).operation_label(), "r,w");
+    }
+
     #[test]
     fn read_and_write_events_update_the_correct_counters() {
         let now = Instant::now();
@@ -242,7 +272,7 @@ mod tests {
         assert_eq!(stats[0].cumulative_read, 1_024);
         assert_eq!(stats[0].cumulative_write, 2_048);
         assert_eq!(stats[0].cumulative_total, 3_072);
-        assert_eq!(stats[0].operation_label(), "read/write");
+        assert_eq!(stats[0].operation_label(), "r,w");
     }
 
     #[test]

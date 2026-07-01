@@ -291,22 +291,43 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DetailRenderContext<'a> {
+    accumulator: &'a detail::FileIoAccumulator,
+    fallback: &'a detail::FallbackDetails,
+    elapsed_seconds: f64,
+    limit: usize,
+}
+
+impl DetailRenderContext<'_> {
+    fn uses_fallback(self, processes: &[&ProcessStats]) -> bool {
+        processes.is_empty()
+            || processes.iter().any(|process_stats| {
+                self.accumulator
+                    .sorted_for_pid(process_stats.pid, self.limit)
+                    .is_empty()
+            })
+    }
+}
+
 fn render<W: Write>(
     writer: &mut W,
     processes: &[&ProcessStats],
     interval: Duration,
-    details: Option<&detail::FallbackDetails>,
+    details: Option<DetailRenderContext<'_>>,
 ) -> io::Result<()> {
     // 화면을 지우고 커서를 왼쪽 위로 이동한다.
     write!(writer, "\x1b[2J\x1b[H")?;
-    if details.is_some() {
+    if let Some(details) = details {
         writeln!(
             writer,
             "Process disk I/O (interval: {} ms, top {}, detail: on)",
             interval.as_millis(),
             MAX_PROCESSES
         )?;
-        writeln!(writer, "{}", detail::FALLBACK_NOTICE)?;
+        if details.uses_fallback(processes) {
+            writeln!(writer, "{}", detail::FALLBACK_NOTICE)?;
+        }
     } else {
         writeln!(
             writer,
@@ -342,7 +363,7 @@ fn render<W: Write>(
         )?;
 
         if let Some(details) = details {
-            render_fallback_details(writer, process_stats, details)?;
+            render_process_details(writer, process_stats, details)?;
         }
     }
 
@@ -351,6 +372,70 @@ fn render<W: Write>(
     }
 
     writer.flush()
+}
+
+fn render_process_details<W: Write>(
+    writer: &mut W,
+    process_stats: &ProcessStats,
+    details: DetailRenderContext<'_>,
+) -> io::Result<()> {
+    let file_stats = details
+        .accumulator
+        .sorted_for_pid(process_stats.pid, details.limit);
+
+    if file_stats.is_empty() {
+        render_fallback_details(writer, process_stats, details.fallback)
+    } else {
+        render_file_io_details(writer, &file_stats, details.elapsed_seconds)
+    }
+}
+
+fn render_file_io_details<W: Write>(
+    writer: &mut W,
+    files: &[&detail::FileIoStats],
+    elapsed_seconds: f64,
+) -> io::Result<()> {
+    for (index, file) in files.iter().enumerate() {
+        let branch = if index + 1 == files.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        writeln!(
+            writer,
+            "         {branch} {}",
+            format_file_io_detail(file, elapsed_seconds)
+        )?;
+    }
+
+    Ok(())
+}
+
+fn format_file_io_detail(file: &detail::FileIoStats, elapsed_seconds: f64) -> String {
+    debug_assert!(elapsed_seconds > 0.0);
+    let mut fields = vec![format!("{:<3}", file.operation_label())];
+
+    if file.read_bytes_interval > 0 {
+        fields.push(format!(
+            "r: {}",
+            format_bytes_per_sec(file.read_bytes_interval as f64 / elapsed_seconds)
+        ));
+    }
+    if file.write_bytes_interval > 0 {
+        fields.push(format!(
+            "w: {}",
+            format_bytes_per_sec(file.write_bytes_interval as f64 / elapsed_seconds)
+        ));
+    }
+    if file.cumulative_read > 0 {
+        fields.push(format!("cum r: {}", format_bytes(file.cumulative_read)));
+    }
+    if file.cumulative_write > 0 {
+        fields.push(format!("cum w: {}", format_bytes(file.cumulative_write)));
+    }
+    fields.push(sanitize_for_terminal(&file.path));
+
+    fields.join("   ")
 }
 
 fn render_fallback_details<W: Write>(
@@ -410,10 +495,15 @@ fn run(
     let mut previous = collect_samples()?;
     let mut previous_sampled_at = Instant::now();
     let mut stats = HashMap::new();
+    // 실제 이벤트 소스가 연결되면 interval 동안 이 누적기에 이벤트를 기록한다.
+    let mut file_io_accumulator = detail_enabled.then(detail::FileIoAccumulator::default);
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
     loop {
+        if let Some(accumulator) = file_io_accumulator.as_mut() {
+            accumulator.begin_interval();
+        }
         thread::sleep(interval);
 
         let current = collect_samples()?;
@@ -428,7 +518,7 @@ fn run(
             retain_exited,
         );
         let processes = stats_for_display(&stats);
-        let details = detail_enabled.then(|| {
+        let fallback_details = detail_enabled.then(|| {
             detail::collect_fallback_details(
                 processes
                     .iter()
@@ -437,8 +527,17 @@ fn run(
                 detail_limit,
             )
         });
+        let details = match (&file_io_accumulator, &fallback_details) {
+            (Some(accumulator), Some(fallback)) => Some(DetailRenderContext {
+                accumulator,
+                fallback,
+                elapsed_seconds,
+                limit: detail_limit,
+            }),
+            _ => None,
+        };
 
-        render(&mut output, &processes, interval, details.as_ref())?;
+        render(&mut output, &processes, interval, details)?;
 
         previous = current;
         previous_sampled_at = sampled_at;
@@ -469,6 +568,43 @@ mod tests {
             name: name.into(),
             read_bytes,
             write_bytes,
+        }
+    }
+
+    fn file_stats(
+        read_bytes_interval: u64,
+        write_bytes_interval: u64,
+        cumulative_read: u64,
+        cumulative_write: u64,
+        path: &str,
+    ) -> detail::FileIoStats {
+        detail::FileIoStats {
+            pid: 10,
+            process_start_time: 99,
+            fd: 3,
+            path: path.into(),
+            read_bytes_interval,
+            write_bytes_interval,
+            cumulative_read,
+            cumulative_write,
+            cumulative_total: cumulative_read.saturating_add(cumulative_write),
+            last_io_at: Instant::now(),
+        }
+    }
+
+    fn process_stats() -> ProcessStats {
+        ProcessStats {
+            pid: 10,
+            name: "worker".into(),
+            read_bps: 0.0,
+            write_bps: 0.0,
+            total_bps: 0.0,
+            cumulative_read: 1_024,
+            cumulative_write: 2_048,
+            cumulative_total: 3_072,
+            last_seen: Instant::now(),
+            last_io_at: Some(Instant::now()),
+            exited: false,
         }
     }
 
@@ -635,6 +771,91 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1_536), "1.5 KB");
         assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[test]
+    fn formats_mixed_file_io_with_separate_rates_and_cumulative_values() {
+        let file = file_stats(
+            1024 * 1024,
+            2 * 1024,
+            10 * 1024 * 1024,
+            512 * 1024,
+            "/tmp/data",
+        );
+
+        let output = format_file_io_detail(&file, 1.0);
+
+        assert!(output.starts_with("r,w"));
+        assert!(output.contains("r: 1.0 MB/s"));
+        assert!(output.contains("w: 2.0 KB/s"));
+        assert!(output.contains("cum r: 10.0 MB"));
+        assert!(output.contains("cum w: 512.0 KB"));
+        assert!(output.ends_with("/tmp/data"));
+    }
+
+    #[test]
+    fn actual_file_stats_are_rendered_instead_of_fallback_entries() {
+        let now = Instant::now();
+        let mut accumulator = detail::FileIoAccumulator::default();
+        accumulator.record_event(
+            detail::FileIoEvent {
+                pid: 10,
+                tid: 10,
+                fd: 3,
+                op: detail::IoOperation::Read as u8,
+                bytes: 1_024,
+            },
+            99,
+            "/tmp/data".into(),
+            now,
+        );
+        let fallback = HashMap::from([(
+            10,
+            vec![detail::OpenFileCandidate {
+                fd: 4,
+                path: "/tmp/fallback".into(),
+            }],
+        )]);
+        let mut output = Vec::new();
+
+        render_process_details(
+            &mut output,
+            &process_stats(),
+            DetailRenderContext {
+                accumulator: &accumulator,
+                fallback: &fallback,
+                elapsed_seconds: 1.0,
+                limit: 5,
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("r: 1.0 KB/s"));
+        assert!(output.contains("cum r: 1.0 KB"));
+        assert!(!output.contains("open"));
+        assert!(!output.contains("/tmp/fallback"));
+    }
+
+    #[test]
+    fn fallback_details_never_claim_read_write_or_speed_values() {
+        let fallback = HashMap::from([(
+            10,
+            vec![detail::OpenFileCandidate {
+                fd: 3,
+                path: "/tmp/data".into(),
+            }],
+        )]);
+        let mut output = Vec::new();
+
+        render_fallback_details(&mut output, &process_stats(), &fallback).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("open   fd=3"));
+        assert!(!output.contains("r: "));
+        assert!(!output.contains("w: "));
+        assert!(!output.contains("r,w"));
+        assert!(!output.contains("B/s"));
     }
 
     #[test]
