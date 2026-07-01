@@ -295,6 +295,7 @@ fn format_bytes(bytes: u64) -> String {
 struct DetailRenderContext<'a> {
     accumulator: &'a detail::FileIoAccumulator,
     fallback: &'a detail::FallbackDetails,
+    event_source_error: Option<&'a str>,
     elapsed_seconds: f64,
     limit: usize,
 }
@@ -327,6 +328,13 @@ fn render<W: Write>(
         )?;
         if details.uses_fallback(processes) {
             writeln!(writer, "{}", detail::FALLBACK_NOTICE)?;
+            if let Some(error) = details.event_source_error {
+                writeln!(
+                    writer,
+                    "detail event source unavailable: {}",
+                    sanitize_for_terminal(error)
+                )?;
+            }
         }
     } else {
         writeln!(
@@ -448,12 +456,12 @@ fn render_fallback_details<W: Write>(
     if process_stats.exited {
         return writeln!(
             writer,
-            "         └─ open   file descriptors unavailable (process exited)"
+            "         └─ open-fd   file descriptors unavailable (process exited)"
         );
     }
 
     let Some(files) = files.filter(|files| !files.is_empty()) else {
-        return writeln!(writer, "         └─ open   no readable file descriptors");
+        return writeln!(writer, "         └─ open-fd   no readable file descriptors");
     };
 
     for (index, file) in files.iter().enumerate() {
@@ -464,7 +472,7 @@ fn render_fallback_details<W: Write>(
         };
         writeln!(
             writer,
-            "         {branch} open   fd={:<4} {}",
+            "         {branch} open-fd   fd={:<4} {}",
             file.fd,
             sanitize_for_terminal(&file.path)
         )?;
@@ -495,8 +503,15 @@ fn run(
     let mut previous = collect_samples()?;
     let mut previous_sampled_at = Instant::now();
     let mut stats = HashMap::new();
-    // 실제 이벤트 소스가 연결되면 interval 동안 이 누적기에 이벤트를 기록한다.
     let mut file_io_accumulator = detail_enabled.then(detail::FileIoAccumulator::default);
+    let (event_source, event_source_error) = if detail_enabled {
+        match detail::FileIoEventSource::start() {
+            Ok(source) => (Some(source), None),
+            Err(error) => (None, Some(error)),
+        }
+    } else {
+        (None, None)
+    };
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -505,6 +520,19 @@ fn run(
             accumulator.begin_interval();
         }
         thread::sleep(interval);
+
+        if let (Some(event_source), Some(accumulator)) =
+            (&event_source, file_io_accumulator.as_mut())
+        {
+            while let Some(resolved) = event_source.try_recv() {
+                accumulator.record_event(
+                    resolved.event,
+                    resolved.process_start_time,
+                    resolved.path,
+                    resolved.occurred_at,
+                );
+            }
+        }
 
         let current = collect_samples()?;
         let sampled_at = Instant::now();
@@ -531,6 +559,7 @@ fn run(
             (Some(accumulator), Some(fallback)) => Some(DetailRenderContext {
                 accumulator,
                 fallback,
+                event_source_error: event_source_error.as_deref(),
                 elapsed_seconds,
                 limit: detail_limit,
             }),
@@ -606,6 +635,26 @@ mod tests {
             last_io_at: Some(Instant::now()),
             exited: false,
         }
+    }
+
+    fn render_accumulated_file_io(accumulator: &detail::FileIoAccumulator) -> String {
+        let fallback = HashMap::new();
+        let mut output = Vec::new();
+
+        render_process_details(
+            &mut output,
+            &process_stats(),
+            DetailRenderContext {
+                accumulator,
+                fallback: &fallback,
+                event_source_error: None,
+                elapsed_seconds: 1.0,
+                limit: 5,
+            },
+        )
+        .unwrap();
+
+        String::from_utf8(output).unwrap()
     }
 
     #[test]
@@ -824,6 +873,7 @@ mod tests {
             DetailRenderContext {
                 accumulator: &accumulator,
                 fallback: &fallback,
+                event_source_error: None,
                 elapsed_seconds: 1.0,
                 limit: 5,
             },
@@ -833,8 +883,59 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("r: 1.0 KB/s"));
         assert!(output.contains("cum r: 1.0 KB"));
-        assert!(!output.contains("open"));
+        assert!(!output.contains("open-fd"));
         assert!(!output.contains("/tmp/fallback"));
+    }
+
+    #[test]
+    fn write_event_renders_write_detail() {
+        let mut accumulator = detail::FileIoAccumulator::default();
+        accumulator.record_event(
+            detail::FileIoEvent {
+                pid: 10,
+                tid: 10,
+                fd: 4,
+                op: detail::IoOperation::Write as u8,
+                bytes: 2 * 1024,
+            },
+            99,
+            "/tmp/output".into(),
+            Instant::now(),
+        );
+
+        let output = render_accumulated_file_io(&accumulator);
+        assert!(output.contains("└─ w"));
+        assert!(output.contains("w: 2.0 KB/s"));
+        assert!(output.contains("cum w: 2.0 KB"));
+        assert!(!output.contains("open-fd"));
+    }
+
+    #[test]
+    fn mixed_events_render_both_read_and_write_details() {
+        let mut accumulator = detail::FileIoAccumulator::default();
+        for (operation, bytes) in [
+            (detail::IoOperation::Read, 1024),
+            (detail::IoOperation::Write, 2 * 1024),
+        ] {
+            accumulator.record_event(
+                detail::FileIoEvent {
+                    pid: 10,
+                    tid: 10,
+                    fd: 5,
+                    op: operation as u8,
+                    bytes,
+                },
+                99,
+                "/tmp/mixed".into(),
+                Instant::now(),
+            );
+        }
+
+        let output = render_accumulated_file_io(&accumulator);
+        assert!(output.contains("└─ r,w"));
+        assert!(output.contains("r: 1.0 KB/s"));
+        assert!(output.contains("w: 2.0 KB/s"));
+        assert!(!output.contains("open-fd"));
     }
 
     #[test]
@@ -851,11 +952,13 @@ mod tests {
         render_fallback_details(&mut output, &process_stats(), &fallback).unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("open   fd=3"));
+        assert!(output.contains("open-fd   fd=3"));
         assert!(!output.contains("r: "));
         assert!(!output.contains("w: "));
         assert!(!output.contains("r,w"));
         assert!(!output.contains("B/s"));
+        assert!(!output.contains("KB/s"));
+        assert!(!output.contains("MB/s"));
     }
 
     #[test]

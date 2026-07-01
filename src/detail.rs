@@ -1,9 +1,18 @@
+use aya::Ebpf;
+use aya::maps::RingBuf;
+use aya::programs::TracePoint;
 use std::collections::HashMap;
 use std::fs;
-use std::time::Instant;
+use std::io;
+use std::mem;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TrySendError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 pub const FALLBACK_NOTICE: &str =
-    "detail fallback mode: showing open file descriptors, not actual per-file I/O.";
+    "detail fallback mode: showing open file descriptors only, not actual read/write I/O.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -33,6 +42,151 @@ pub struct FileIoEvent {
     pub fd: i32,
     pub op: u8,
     pub bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct ResolvedFileIoEvent {
+    pub event: FileIoEvent,
+    pub process_start_time: u64,
+    pub path: String,
+    pub occurred_at: Instant,
+}
+
+pub struct FileIoEventSource {
+    receiver: Receiver<ResolvedFileIoEvent>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl FileIoEventSource {
+    pub fn start() -> Result<Self, String> {
+        const EBPF_OBJECT: &[u8] =
+            aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/file_io.bpf.o"));
+
+        if EBPF_OBJECT.is_empty() {
+            return Err("eBPF object was not built; install clang with BPF target support".into());
+        }
+
+        let mut ebpf = Ebpf::load(EBPF_OBJECT).map_err(|error| {
+            format!(
+                "failed to load eBPF object: {error}; try running as root or with CAP_BPF/CAP_PERFMON"
+            )
+        })?;
+        attach_syscall_tracepoints(&mut ebpf)?;
+
+        let events = ebpf
+            .take_map("EVENTS")
+            .ok_or_else(|| "eBPF EVENTS ring buffer is missing".to_string())?;
+        let mut ring_buffer = RingBuf::try_from(events)
+            .map_err(|error| format!("failed to open eBPF ring buffer: {error}"))?;
+        let (sender, receiver) = mpsc::sync_channel(65_536);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let monitor_pid = std::process::id();
+        let worker = thread::Builder::new()
+            .name("apps-disk-io-ebpf".into())
+            .spawn(move || {
+                // Programs and their links remain attached while `ebpf` is alive.
+                let _ebpf = ebpf;
+
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let mut received_event = false;
+
+                    while let Some(item) = ring_buffer.next() {
+                        received_event = true;
+                        let Some(event) = parse_file_io_event(&item) else {
+                            continue;
+                        };
+                        // Resolving an event reads `/proc`; ignore our own I/O to avoid feedback.
+                        if event.pid == monitor_pid {
+                            continue;
+                        }
+                        let resolved = ResolvedFileIoEvent {
+                            process_start_time: read_process_start_time(event.pid)
+                                .unwrap_or_default(),
+                            path: resolve_fd_path(event.pid, event.fd),
+                            event,
+                            occurred_at: Instant::now(),
+                        };
+
+                        match sender.try_send(resolved) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => return,
+                        }
+                    }
+
+                    if !received_event {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to start eBPF event reader: {error}"))?;
+
+        Ok(Self {
+            receiver,
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    pub fn try_recv(&self) -> Option<ResolvedFileIoEvent> {
+        self.receiver.try_recv().ok()
+    }
+}
+
+impl Drop for FileIoEventSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn attach_syscall_tracepoints(ebpf: &mut Ebpf) -> Result<(), String> {
+    for syscall in ["read", "write", "pread64", "pwrite64", "readv", "writev"] {
+        attach_tracepoint(
+            ebpf,
+            &format!("enter_{syscall}"),
+            &format!("sys_enter_{syscall}"),
+        )?;
+        attach_tracepoint(
+            ebpf,
+            &format!("exit_{syscall}"),
+            &format!("sys_exit_{syscall}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn attach_tracepoint(ebpf: &mut Ebpf, program_name: &str, tracepoint: &str) -> Result<(), String> {
+    let program: &mut TracePoint = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| format!("eBPF program '{program_name}' is missing"))?
+        .try_into()
+        .map_err(|error| format!("'{program_name}' is not a tracepoint program: {error}"))?;
+
+    program
+        .load()
+        .map_err(|error| format!("failed to load '{program_name}': {error}"))?;
+    program
+        .attach("syscalls", tracepoint)
+        .map_err(|error| format!("failed to attach '{tracepoint}': {error}"))?;
+    Ok(())
+}
+
+fn parse_file_io_event(bytes: &[u8]) -> Option<FileIoEvent> {
+    if bytes.len() < mem::size_of::<FileIoEvent>() {
+        return None;
+    }
+
+    Some(FileIoEvent {
+        pid: u32::from_ne_bytes(bytes[0..4].try_into().ok()?),
+        tid: u32::from_ne_bytes(bytes[4..8].try_into().ok()?),
+        fd: i32::from_ne_bytes(bytes[8..12].try_into().ok()?),
+        op: bytes[12],
+        bytes: u64::from_ne_bytes(bytes[16..24].try_into().ok()?),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -185,6 +339,9 @@ fn collect_open_file_candidates(pid: u32, limit: usize) -> Vec<OpenFileCandidate
         else {
             continue;
         };
+        if fd <= 2 {
+            continue;
+        }
 
         files.push(OpenFileCandidate {
             fd,
@@ -201,6 +358,27 @@ pub fn resolve_fd_path(pid: u32, fd: i32) -> String {
     fs::read_link(format!("/proc/{pid}/fd/{fd}"))
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| format!("fd:{fd} (unresolved)"))
+}
+
+pub fn read_process_start_time(pid: u32) -> io::Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    parse_process_start_time(&stat)
+}
+
+fn parse_process_start_time(stat: &str) -> io::Result<u64> {
+    // `comm` may contain spaces and parentheses, so split only after its final `)`.
+    let comm_end = stat.rfind(')').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid /proc/<pid>/stat format",
+        )
+    })?;
+    stat[comm_end + 1..]
+        .split_whitespace()
+        .nth(19) // field 22 (starttime); this slice starts at field 3 (state)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "starttime field is missing"))?
+        .parse::<u64>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
@@ -318,5 +496,39 @@ mod tests {
     #[test]
     fn unresolved_fd_uses_fallback_path() {
         assert_eq!(resolve_fd_path(u32::MAX, -1), "fd:-1 (unresolved)");
+    }
+
+    #[test]
+    fn fallback_candidates_exclude_standard_streams() {
+        let files = collect_open_file_candidates(std::process::id(), usize::MAX);
+        assert!(files.iter().all(|file| file.fd > 2));
+    }
+
+    #[test]
+    fn parses_process_start_time_after_complex_process_name() {
+        let stat =
+            "123 (name with ) parentheses) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242";
+        assert_eq!(parse_process_start_time(stat).unwrap(), 4242);
+    }
+
+    #[test]
+    fn parses_ring_buffer_event_layout() {
+        let mut bytes = [0_u8; 24];
+        bytes[0..4].copy_from_slice(&10_u32.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&11_u32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&3_i32.to_ne_bytes());
+        bytes[12] = IoOperation::Write as u8;
+        bytes[16..24].copy_from_slice(&4096_u64.to_ne_bytes());
+
+        assert_eq!(
+            parse_file_io_event(&bytes),
+            Some(FileIoEvent {
+                pid: 10,
+                tid: 11,
+                fd: 3,
+                op: IoOperation::Write as u8,
+                bytes: 4096,
+            })
+        );
     }
 }
