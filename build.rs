@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -21,11 +21,8 @@ fn main() {
     ]);
     command.arg(&out_file);
 
-    if let Ok(host) = env::var("HOST") {
-        let multiarch_include = PathBuf::from(format!("/usr/include/{host}"));
-        if multiarch_include.is_dir() {
-            command.arg(format!("-I{}", multiarch_include.display()));
-        }
+    for include_dir in candidate_multiarch_include_dirs() {
+        add_include_dir_if_exists(&mut command, include_dir);
     }
 
     match command.status() {
@@ -42,5 +39,47 @@ fn main() {
             );
             fs::write(&out_file, []).expect("write empty fallback eBPF object");
         }
+    }
+}
+
+fn candidate_multiarch_include_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(host) = env::var("HOST") {
+        dirs.push(PathBuf::from(format!("/usr/include/{host}")));
+    }
+
+    if let Some(triple) = linux_gnu_include_triple() {
+        dirs.push(PathBuf::from(format!("/usr/include/{triple}")));
+    }
+
+    dirs
+}
+
+fn linux_gnu_include_triple() -> Option<&'static str> {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").ok()?;
+
+    match arch.as_str() {
+        "x86_64" => Some("x86_64-linux-gnu"),
+        "aarch64" => Some("aarch64-linux-gnu"),
+        "arm" => Some("arm-linux-gnueabihf"),
+        "riscv64" => Some("riscv64-linux-gnu"),
+        "s390x" => Some("s390x-linux-gnu"),
+        "powerpc64" => {
+            if env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() == Ok("little") {
+                Some("powerpc64le-linux-gnu")
+            } else {
+                Some("powerpc64-linux-gnu")
+            }
+        }
+        _ => None,
+    }
+}
+
+fn add_include_dir_if_exists(command: &mut Command, path: impl AsRef<Path>) {
+    let path = path.as_ref();
+
+    if path.is_dir() {
+        command.arg(format!("-I{}", path.display()));
     }
 }
