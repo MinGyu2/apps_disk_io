@@ -32,7 +32,7 @@ struct Cli {
     interval: u64,
 
     /// 프로세스 정렬 기준
-    #[arg(long, value_enum, default_value = "current")]
+    #[arg(long, value_enum, default_value = "total")]
     sort: SortMode,
 
     /// 종료된 프로세스를 화면에 유지할 시간(초)
@@ -73,8 +73,13 @@ struct Cli {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SortMode {
-    Current,
-    Cumulative,
+    #[value(alias = "current")]
+    Total,
+    Name,
+    #[value(alias = "cumulative")]
+    CumulativeTotal,
+    CumulativeRead,
+    CumulativeWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,8 +318,11 @@ fn stats_for_display(
 
     processes.sort_unstable_by(|left, right| {
         let ordering = match sort_mode {
-            SortMode::Current => right.total_bps.total_cmp(&left.total_bps),
-            SortMode::Cumulative => right.cumulative_total.cmp(&left.cumulative_total),
+            SortMode::Total => right.total_bps.total_cmp(&left.total_bps),
+            SortMode::Name => left.name.cmp(&right.name),
+            SortMode::CumulativeTotal => right.cumulative_total.cmp(&left.cumulative_total),
+            SortMode::CumulativeRead => right.cumulative_read.cmp(&left.cumulative_read),
+            SortMode::CumulativeWrite => right.cumulative_write.cmp(&left.cumulative_write),
         };
 
         ordering.then_with(|| left.pid.cmp(&right.pid))
@@ -712,16 +720,22 @@ mod tests {
         }
     }
 
-    fn sortable_process_stats(pid: u32, total_bps: f64, cumulative_total: u64) -> ProcessStats {
+    fn sortable_process_stats(
+        pid: u32,
+        name: &str,
+        total_bps: f64,
+        cumulative_read: u64,
+        cumulative_write: u64,
+    ) -> ProcessStats {
         ProcessStats {
             pid,
-            name: format!("process-{pid}"),
+            name: name.into(),
             read_bps: total_bps,
             write_bps: 0.0,
             total_bps,
-            cumulative_read: cumulative_total,
-            cumulative_write: 0,
-            cumulative_total,
+            cumulative_read,
+            cumulative_write,
+            cumulative_total: cumulative_read.saturating_add(cumulative_write),
             last_seen: Instant::now(),
             last_io_at: Some(Instant::now()),
             exited: false,
@@ -797,7 +811,7 @@ mod tests {
         let process_stats = stats.get(&10).unwrap();
         assert_eq!(process_stats.total_bps, 0.0);
         assert_eq!(process_stats.cumulative_total, 3_000);
-        assert_eq!(stats_for_display(&stats, SortMode::Current)[0].pid, 10);
+        assert_eq!(stats_for_display(&stats, SortMode::Total)[0].pid, 10);
     }
 
     #[test]
@@ -816,7 +830,7 @@ mod tests {
         );
 
         assert!(stats.contains_key(&10));
-        assert!(stats_for_display(&stats, SortMode::Current).is_empty());
+        assert!(stats_for_display(&stats, SortMode::Total).is_empty());
     }
 
     #[test]
@@ -885,26 +899,65 @@ mod tests {
     }
 
     #[test]
-    fn current_sort_uses_total_bps() {
+    fn total_sort_uses_total_bps() {
         let stats = HashMap::from([
-            (10, sortable_process_stats(10, 500.0, 100)),
-            (20, sortable_process_stats(20, 100.0, 1_000)),
+            (10, sortable_process_stats(10, "alpha", 500.0, 100, 0)),
+            (20, sortable_process_stats(20, "beta", 100.0, 1_000, 0)),
         ]);
 
-        let processes = stats_for_display(&stats, SortMode::Current);
+        let processes = stats_for_display(&stats, SortMode::Total);
 
         assert_eq!(processes[0].pid, 10);
         assert_eq!(processes[1].pid, 20);
     }
 
     #[test]
-    fn cumulative_sort_uses_cumulative_total() {
+    fn name_sort_uses_process_name() {
         let stats = HashMap::from([
-            (10, sortable_process_stats(10, 500.0, 100)),
-            (20, sortable_process_stats(20, 100.0, 1_000)),
+            (10, sortable_process_stats(10, "zeta", 500.0, 100, 0)),
+            (20, sortable_process_stats(20, "alpha", 100.0, 1_000, 0)),
         ]);
 
-        let processes = stats_for_display(&stats, SortMode::Cumulative);
+        let processes = stats_for_display(&stats, SortMode::Name);
+
+        assert_eq!(processes[0].pid, 20);
+        assert_eq!(processes[1].pid, 10);
+    }
+
+    #[test]
+    fn cumulative_total_sort_uses_cumulative_total() {
+        let stats = HashMap::from([
+            (10, sortable_process_stats(10, "alpha", 500.0, 50, 50)),
+            (20, sortable_process_stats(20, "beta", 100.0, 400, 600)),
+        ]);
+
+        let processes = stats_for_display(&stats, SortMode::CumulativeTotal);
+
+        assert_eq!(processes[0].pid, 20);
+        assert_eq!(processes[1].pid, 10);
+    }
+
+    #[test]
+    fn cumulative_read_sort_uses_cumulative_read() {
+        let stats = HashMap::from([
+            (10, sortable_process_stats(10, "alpha", 500.0, 900, 100)),
+            (20, sortable_process_stats(20, "beta", 100.0, 100, 1_900)),
+        ]);
+
+        let processes = stats_for_display(&stats, SortMode::CumulativeRead);
+
+        assert_eq!(processes[0].pid, 10);
+        assert_eq!(processes[1].pid, 20);
+    }
+
+    #[test]
+    fn cumulative_write_sort_uses_cumulative_write() {
+        let stats = HashMap::from([
+            (10, sortable_process_stats(10, "alpha", 500.0, 900, 100)),
+            (20, sortable_process_stats(20, "beta", 100.0, 100, 1_900)),
+        ]);
+
+        let processes = stats_for_display(&stats, SortMode::CumulativeWrite);
 
         assert_eq!(processes[0].pid, 20);
         assert_eq!(processes[1].pid, 10);
@@ -913,11 +966,17 @@ mod tests {
     #[test]
     fn sort_ties_are_broken_by_pid() {
         let stats = HashMap::from([
-            (20, sortable_process_stats(20, 100.0, 1_000)),
-            (10, sortable_process_stats(10, 100.0, 1_000)),
+            (20, sortable_process_stats(20, "same", 100.0, 500, 500)),
+            (10, sortable_process_stats(10, "same", 100.0, 500, 500)),
         ]);
 
-        for sort_mode in [SortMode::Current, SortMode::Cumulative] {
+        for sort_mode in [
+            SortMode::Total,
+            SortMode::Name,
+            SortMode::CumulativeTotal,
+            SortMode::CumulativeRead,
+            SortMode::CumulativeWrite,
+        ] {
             let processes = stats_for_display(&stats, sort_mode);
             assert_eq!(processes[0].pid, 10);
             assert_eq!(processes[1].pid, 20);
@@ -1152,7 +1211,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(cli.interval, 500);
-        assert_eq!(cli.sort, SortMode::Current);
+        assert_eq!(cli.sort, SortMode::Total);
         assert_eq!(cli.retain_exited, 60);
         assert!(!cli.detail);
         assert!(!cli.fd);
@@ -1161,15 +1220,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_sort_option() {
-        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "current"]).unwrap();
-        assert_eq!(cli.sort, SortMode::Current);
+    fn default_sort_is_total() {
+        let cli = Cli::try_parse_from(["apps_disk_io"]).unwrap();
+        assert_eq!(cli.sort, SortMode::Total);
     }
 
     #[test]
-    fn parses_cumulative_sort_option() {
+    fn parses_total_sort_option() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "total"]).unwrap();
+        assert_eq!(cli.sort, SortMode::Total);
+    }
+
+    #[test]
+    fn parses_current_sort_alias() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "current"]).unwrap();
+        assert_eq!(cli.sort, SortMode::Total);
+    }
+
+    #[test]
+    fn parses_name_sort_option() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "name"]).unwrap();
+        assert_eq!(cli.sort, SortMode::Name);
+    }
+
+    #[test]
+    fn parses_cumulative_total_sort_option() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "cumulative-total"]).unwrap();
+        assert_eq!(cli.sort, SortMode::CumulativeTotal);
+    }
+
+    #[test]
+    fn parses_cumulative_sort_alias() {
         let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "cumulative"]).unwrap();
-        assert_eq!(cli.sort, SortMode::Cumulative);
+        assert_eq!(cli.sort, SortMode::CumulativeTotal);
+    }
+
+    #[test]
+    fn parses_cumulative_read_sort_option() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "cumulative-read"]).unwrap();
+        assert_eq!(cli.sort, SortMode::CumulativeRead);
+    }
+
+    #[test]
+    fn parses_cumulative_write_sort_option() {
+        let cli = Cli::try_parse_from(["apps_disk_io", "--sort", "cumulative-write"]).unwrap();
+        assert_eq!(cli.sort, SortMode::CumulativeWrite);
     }
 
     #[test]

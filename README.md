@@ -2,7 +2,7 @@
 
 `apps_disk_io`는 Linux에서 실행 중인 프로세스별 디스크 읽기/쓰기 속도와 누적량을 표시하는 CLI 모니터링 도구입니다. 기본 모드는 `/proc/<pid>/io`를 사용하고, `--detail` 모드는 Aya/eBPF로 syscall 이벤트를 수집해 파일별 I/O를 함께 표시합니다.
 
-기본 정렬은 현재 읽기/쓰기 속도의 합계(`total_bps`)가 큰 순서입니다. `--sort cumulative`를 사용하면 실행 후 누적 I/O가 큰 순서로 볼 수 있습니다. 정렬 값이 같으면 PID가 작은 프로세스가 먼저 표시됩니다.
+기본 정렬은 현재 interval의 전체 I/O 속도(`total_bps`)가 큰 순서인 `total`입니다. 프로세스 이름이나 누적 전체/read/write I/O 기준으로도 정렬할 수 있습니다. 이름 또는 정렬 값이 같으면 PID가 작은 프로세스가 먼저 표시됩니다.
 
 ## 빌드
 
@@ -30,11 +30,17 @@ eBPF 오브젝트 빌드에는 clang과 clang의 BPF target 지원이 필요할 
 ./target/release/apps_disk_io --interval 1000
 ```
 
-누적 I/O 기준으로 정렬:
+정렬 기준 지정:
 
 ```bash
-./target/release/apps_disk_io --sort cumulative
+./target/release/apps_disk_io --sort total
+./target/release/apps_disk_io --sort name
+./target/release/apps_disk_io --sort cumulative-read
+./target/release/apps_disk_io --sort cumulative-write
+./target/release/apps_disk_io --sort cumulative-total
 ```
+
+기존 `current`와 `cumulative`는 호환성을 위해 각각 `total`과 `cumulative-total`의 alias로 유지됩니다.
 
 파일별 I/O detail 표시:
 
