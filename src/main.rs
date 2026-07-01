@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_RETAIN_EXITED_SECONDS: u64 = 30;
 const MAX_PROCESSES: usize = 20;
 
 #[derive(Debug, Parser)]
@@ -25,6 +26,14 @@ struct Cli {
         value_parser = parse_interval
     )]
     interval: u64,
+
+    /// 종료된 프로세스를 화면에 유지할 시간(초)
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_RETAIN_EXITED_SECONDS
+    )]
+    retain_exited: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,13 +43,19 @@ struct ProcessSample {
     write_bytes: u64,
 }
 
-#[derive(Debug, PartialEq)]
-struct ProcessRate {
+#[derive(Debug, Clone, PartialEq)]
+struct ProcessStats {
     pid: u32,
     name: String,
-    read_bytes_per_sec: f64,
-    write_bytes_per_sec: f64,
-    total_bytes_per_sec: f64,
+    read_bps: f64,
+    write_bps: f64,
+    total_bps: f64,
+    cumulative_read: u64,
+    cumulative_write: u64,
+    cumulative_total: u64,
+    last_seen: Instant,
+    last_io_at: Option<Instant>,
+    exited: bool,
 }
 
 fn parse_interval(value: &str) -> Result<u64, String> {
@@ -141,44 +156,95 @@ fn calculate_rates(
     previous: &HashMap<u32, ProcessSample>,
     current: &HashMap<u32, ProcessSample>,
     elapsed_seconds: f64,
-) -> Vec<ProcessRate> {
-    let mut rates = Vec::new();
+    stats: &mut HashMap<u32, ProcessStats>,
+    sampled_at: Instant,
+    retain_exited: Duration,
+) {
+    debug_assert!(elapsed_seconds > 0.0);
 
     for (&pid, sample) in current {
-        let Some(previous_sample) = previous.get(&pid) else {
-            continue;
+        let (read_delta, write_delta) = match previous.get(&pid) {
+            Some(previous_sample) => (
+                // 카운터 감소(PID 재사용 또는 커널 카운터 초기화)는 0으로 처리한다.
+                sample.read_bytes.saturating_sub(previous_sample.read_bytes),
+                sample
+                    .write_bytes
+                    .saturating_sub(previous_sample.write_bytes),
+            ),
+            None => (0, 0),
         };
 
-        // 카운터 감소(PID 재사용 또는 커널 카운터 초기화)는 0으로 처리한다.
-        let read_delta = sample.read_bytes.saturating_sub(previous_sample.read_bytes);
-        let write_delta = sample
-            .write_bytes
-            .saturating_sub(previous_sample.write_bytes);
+        let read_bps = read_delta as f64 / elapsed_seconds;
+        let write_bps = write_delta as f64 / elapsed_seconds;
+        let total_delta = read_delta.saturating_add(write_delta);
 
-        if read_delta == 0 && write_delta == 0 {
-            continue;
+        if let Some(process_stats) = stats.get_mut(&pid) {
+            process_stats.name.clone_from(&sample.name);
+            process_stats.read_bps = read_bps;
+            process_stats.write_bps = write_bps;
+            process_stats.total_bps = read_bps + write_bps;
+            process_stats.cumulative_read =
+                process_stats.cumulative_read.saturating_add(read_delta);
+            process_stats.cumulative_write =
+                process_stats.cumulative_write.saturating_add(write_delta);
+            process_stats.cumulative_total = process_stats
+                .cumulative_read
+                .saturating_add(process_stats.cumulative_write);
+            process_stats.last_seen = sampled_at;
+            process_stats.exited = false;
+
+            if total_delta > 0 {
+                process_stats.last_io_at = Some(sampled_at);
+            }
+        } else {
+            stats.insert(
+                pid,
+                ProcessStats {
+                    pid,
+                    name: sample.name.clone(),
+                    read_bps,
+                    write_bps,
+                    total_bps: read_bps + write_bps,
+                    cumulative_read: read_delta,
+                    cumulative_write: write_delta,
+                    cumulative_total: total_delta,
+                    last_seen: sampled_at,
+                    last_io_at: (total_delta > 0).then_some(sampled_at),
+                    exited: false,
+                },
+            );
         }
-
-        let read_bytes_per_sec = read_delta as f64 / elapsed_seconds;
-        let write_bytes_per_sec = write_delta as f64 / elapsed_seconds;
-
-        rates.push(ProcessRate {
-            pid,
-            name: sample.name.clone(),
-            read_bytes_per_sec,
-            write_bytes_per_sec,
-            total_bytes_per_sec: read_bytes_per_sec + write_bytes_per_sec,
-        });
     }
 
-    rates.sort_unstable_by(|left, right| {
+    // 현재 샘플에서 사라진 프로세스는 속도를 0으로 만들고 보존 시간 후 제거한다.
+    stats.retain(|pid, process_stats| {
+        if current.contains_key(pid) {
+            return true;
+        }
+
+        process_stats.read_bps = 0.0;
+        process_stats.write_bps = 0.0;
+        process_stats.total_bps = 0.0;
+        process_stats.exited = true;
+
+        sampled_at.duration_since(process_stats.last_seen) < retain_exited
+    });
+}
+
+fn stats_for_display(stats: &HashMap<u32, ProcessStats>) -> Vec<&ProcessStats> {
+    let mut processes: Vec<_> = stats
+        .values()
+        .filter(|process_stats| process_stats.cumulative_total > 0)
+        .collect();
+
+    processes.sort_unstable_by(|left, right| {
         right
-            .total_bytes_per_sec
-            .total_cmp(&left.total_bytes_per_sec)
+            .cumulative_total
+            .cmp(&left.cumulative_total)
             .then_with(|| left.pid.cmp(&right.pid))
     });
-    rates.truncate(MAX_PROCESSES);
-    rates
+    processes.truncate(MAX_PROCESSES);
+    processes
 }
 
 fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
@@ -197,7 +263,28 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
     }
 }
 
-fn render<W: Write>(writer: &mut W, rates: &[ProcessRate], interval: Duration) -> io::Result<()> {
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn render<W: Write>(
+    writer: &mut W,
+    processes: &[&ProcessStats],
+    interval: Duration,
+) -> io::Result<()> {
     // 화면을 지우고 커서를 왼쪽 위로 이동한다.
     write!(writer, "\x1b[2J\x1b[H")?;
     writeln!(
@@ -208,32 +295,42 @@ fn render<W: Write>(writer: &mut W, rates: &[ProcessRate], interval: Duration) -
     )?;
     writeln!(
         writer,
-        "{:<8} {:<25} {:>14} {:>14} {:>14}",
-        "PID", "NAME", "READ", "WRITE", "TOTAL"
+        "{:<8} {:<25} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "PID", "NAME", "READ/s", "WRITE/s", "TOTAL/s", "CUM_READ", "CUM_WRITE", "CUM_TOTAL"
     )?;
 
-    for rate in rates {
+    for process_stats in processes {
+        let name = if process_stats.exited {
+            format!("{} (exited)", process_stats.name)
+        } else {
+            process_stats.name.clone()
+        };
+
         writeln!(
             writer,
-            "{:<8} {:<25.25} {:>14} {:>14} {:>14}",
-            rate.pid,
-            rate.name,
-            format_bytes_per_sec(rate.read_bytes_per_sec),
-            format_bytes_per_sec(rate.write_bytes_per_sec),
-            format_bytes_per_sec(rate.total_bytes_per_sec),
+            "{:<8} {:<25.25} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            process_stats.pid,
+            name,
+            format_bytes_per_sec(process_stats.read_bps),
+            format_bytes_per_sec(process_stats.write_bps),
+            format_bytes_per_sec(process_stats.total_bps),
+            format_bytes(process_stats.cumulative_read),
+            format_bytes(process_stats.cumulative_write),
+            format_bytes(process_stats.cumulative_total),
         )?;
     }
 
-    if rates.is_empty() {
+    if processes.is_empty() {
         writeln!(writer, "현재 I/O를 수행 중인 프로세스가 없습니다.")?;
     }
 
     writer.flush()
 }
 
-fn run(interval: Duration) -> io::Result<()> {
+fn run(interval: Duration, retain_exited: Duration) -> io::Result<()> {
     let mut previous = collect_samples()?;
     let mut previous_sampled_at = Instant::now();
+    let mut stats = HashMap::new();
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
@@ -243,9 +340,17 @@ fn run(interval: Duration) -> io::Result<()> {
         let current = collect_samples()?;
         let sampled_at = Instant::now();
         let elapsed_seconds = sampled_at.duration_since(previous_sampled_at).as_secs_f64();
-        let rates = calculate_rates(&previous, &current, elapsed_seconds);
+        calculate_rates(
+            &previous,
+            &current,
+            elapsed_seconds,
+            &mut stats,
+            sampled_at,
+            retain_exited,
+        );
+        let processes = stats_for_display(&stats);
 
-        render(&mut output, &rates, interval)?;
+        render(&mut output, &processes, interval)?;
 
         previous = current;
         previous_sampled_at = sampled_at;
@@ -255,8 +360,9 @@ fn run(interval: Duration) -> io::Result<()> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let interval = Duration::from_millis(cli.interval);
+    let retain_exited = Duration::from_secs(cli.retain_exited);
 
-    match run(interval) {
+    match run(interval, retain_exited) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
@@ -269,6 +375,14 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(name: &str, read_bytes: u64, write_bytes: u64) -> ProcessSample {
+        ProcessSample {
+            name: name.into(),
+            read_bytes,
+            write_bytes,
+        }
+    }
 
     #[test]
     fn interval_must_be_a_positive_integer() {
@@ -284,51 +398,141 @@ mod tests {
     }
 
     #[test]
-    fn calculates_and_sorts_non_zero_rates() {
-        let previous = HashMap::from([
-            (
-                10,
-                ProcessSample {
-                    name: "reader".into(),
-                    read_bytes: 1_000,
-                    write_bytes: 500,
-                },
-            ),
-            (
-                20,
-                ProcessSample {
-                    name: "idle".into(),
-                    read_bytes: 100,
-                    write_bytes: 100,
-                },
-            ),
-        ]);
+    fn process_with_zero_delta_remains_visible() {
+        let started_at = Instant::now();
+        let previous = HashMap::from([(10, sample("worker", 100, 200))]);
+        let current = HashMap::from([(10, sample("worker", 1_100, 2_200))]);
+        let mut stats = HashMap::new();
+
+        calculate_rates(
+            &previous,
+            &current,
+            1.0,
+            &mut stats,
+            started_at,
+            Duration::from_secs(30),
+        );
+        calculate_rates(
+            &current,
+            &current,
+            1.0,
+            &mut stats,
+            started_at + Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+
+        let process_stats = stats.get(&10).unwrap();
+        assert_eq!(process_stats.total_bps, 0.0);
+        assert_eq!(process_stats.cumulative_total, 3_000);
+        assert_eq!(stats_for_display(&stats)[0].pid, 10);
+    }
+
+    #[test]
+    fn process_without_any_io_is_not_displayed() {
+        let sampled_at = Instant::now();
+        let samples = HashMap::from([(10, sample("idle", 100, 200))]);
+        let mut stats = HashMap::new();
+
+        calculate_rates(
+            &samples,
+            &samples,
+            1.0,
+            &mut stats,
+            sampled_at,
+            Duration::from_secs(30),
+        );
+
+        assert!(stats.contains_key(&10));
+        assert!(stats_for_display(&stats).is_empty());
+    }
+
+    #[test]
+    fn deltas_increase_cumulative_totals() {
+        let sampled_at = Instant::now();
+        let previous = HashMap::from([(10, sample("writer", 1_000, 500))]);
+        let current = HashMap::from([(10, sample("writer", 3_000, 1_500))]);
+        let mut stats = HashMap::new();
+
+        calculate_rates(
+            &previous,
+            &current,
+            2.0,
+            &mut stats,
+            sampled_at,
+            Duration::from_secs(30),
+        );
+
+        let process_stats = stats.get(&10).unwrap();
+        assert_eq!(process_stats.read_bps, 1_000.0);
+        assert_eq!(process_stats.write_bps, 500.0);
+        assert_eq!(process_stats.cumulative_read, 2_000);
+        assert_eq!(process_stats.cumulative_write, 1_000);
+        assert_eq!(process_stats.cumulative_total, 3_000);
+        assert_eq!(process_stats.last_io_at, Some(sampled_at));
+    }
+
+    #[test]
+    fn exited_process_is_removed_after_retention_period() {
+        let started_at = Instant::now();
+        let previous = HashMap::from([(10, sample("short-lived", 0, 0))]);
+        let current = HashMap::from([(10, sample("short-lived", 1_024, 0))]);
+        let empty = HashMap::new();
+        let retain_exited = Duration::from_secs(30);
+        let mut stats = HashMap::new();
+
+        calculate_rates(
+            &previous,
+            &current,
+            1.0,
+            &mut stats,
+            started_at,
+            retain_exited,
+        );
+        calculate_rates(
+            &current,
+            &empty,
+            1.0,
+            &mut stats,
+            started_at + Duration::from_secs(29),
+            retain_exited,
+        );
+
+        assert!(stats.get(&10).unwrap().exited);
+
+        calculate_rates(
+            &empty,
+            &empty,
+            1.0,
+            &mut stats,
+            started_at + Duration::from_secs(30),
+            retain_exited,
+        );
+
+        assert!(!stats.contains_key(&10));
+    }
+
+    #[test]
+    fn processes_are_sorted_by_cumulative_total() {
+        let sampled_at = Instant::now();
+        let previous = HashMap::from([(10, sample("small", 0, 0)), (20, sample("large", 0, 0))]);
         let current = HashMap::from([
-            (
-                10,
-                ProcessSample {
-                    name: "reader".into(),
-                    read_bytes: 3_000,
-                    write_bytes: 1_500,
-                },
-            ),
-            (
-                20,
-                ProcessSample {
-                    name: "idle".into(),
-                    read_bytes: 100,
-                    write_bytes: 100,
-                },
-            ),
+            (10, sample("small", 100, 50)),
+            (20, sample("large", 200, 300)),
         ]);
+        let mut stats = HashMap::new();
 
-        let rates = calculate_rates(&previous, &current, 2.0);
+        calculate_rates(
+            &previous,
+            &current,
+            1.0,
+            &mut stats,
+            sampled_at,
+            Duration::from_secs(30),
+        );
 
-        assert_eq!(rates.len(), 1);
-        assert_eq!(rates[0].pid, 10);
-        assert_eq!(rates[0].read_bytes_per_sec, 1_000.0);
-        assert_eq!(rates[0].write_bytes_per_sec, 500.0);
-        assert_eq!(rates[0].total_bytes_per_sec, 1_500.0);
+        let processes = stats_for_display(&stats);
+        assert_eq!(processes[0].pid, 20);
+        assert_eq!(processes[1].pid, 10);
     }
 
     #[test]
@@ -340,5 +544,18 @@ mod tests {
             format_bytes_per_sec(3.0 * 1024.0 * 1024.0 * 1024.0),
             "3.0 GB/s"
         );
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1_536), "1.5 KB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[test]
+    fn parses_retain_exited_option() {
+        let cli =
+            Cli::try_parse_from(["apps_disk_io", "--interval", "500", "--retain-exited", "60"])
+                .unwrap();
+
+        assert_eq!(cli.interval, 500);
+        assert_eq!(cli.retain_exited, 60);
     }
 }
