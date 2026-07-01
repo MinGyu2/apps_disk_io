@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -21,11 +21,8 @@ fn main() {
     ]);
     command.arg(&out_file);
 
-    if let Ok(host) = env::var("HOST") {
-        let multiarch_include = PathBuf::from(format!("/usr/include/{host}"));
-        if multiarch_include.is_dir() {
-            command.arg(format!("-I{}", multiarch_include.display()));
-        }
+    for include_dir in candidate_multiarch_include_dirs() {
+        add_include_dir_if_exists(&mut command, include_dir);
     }
 
     match command.status() {
@@ -42,5 +39,50 @@ fn main() {
             );
             fs::write(&out_file, []).expect("write empty fallback eBPF object");
         }
+    }
+}
+
+fn candidate_multiarch_include_dirs() -> Vec<PathBuf> {
+    let include_root = Path::new("/usr/include");
+    let mut candidates = Vec::new();
+
+    if let Ok(host) = env::var("HOST") {
+        candidates.push(include_root.join(host));
+    }
+
+    if let Some(triple) = linux_gnu_include_triple() {
+        let path = include_root.join(triple);
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+
+    candidates
+}
+
+fn linux_gnu_include_triple() -> Option<&'static str> {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        return None;
+    }
+
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").ok()?;
+    let target_endian = env::var("CARGO_CFG_TARGET_ENDIAN").ok();
+
+    match (target_arch.as_str(), target_endian.as_deref()) {
+        ("x86_64", _) => Some("x86_64-linux-gnu"),
+        ("aarch64", _) => Some("aarch64-linux-gnu"),
+        ("arm", _) => Some("arm-linux-gnueabihf"),
+        ("riscv64", _) => Some("riscv64-linux-gnu"),
+        ("s390x", _) => Some("s390x-linux-gnu"),
+        ("powerpc64", Some("little")) => Some("powerpc64le-linux-gnu"),
+        ("powerpc64", Some("big")) => Some("powerpc64-linux-gnu"),
+        _ => None,
+    }
+}
+
+fn add_include_dir_if_exists(command: &mut Command, path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    if path.is_dir() {
+        command.arg("-I").arg(path);
     }
 }
