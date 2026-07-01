@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const FALLBACK_NOTICE: &str =
-    "detail fallback mode: showing open file descriptors only, not actual read/write I/O.";
+    "open fd list: showing open file descriptors only, not actual read/write I/O.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -218,7 +218,7 @@ impl FileIoStats {
     }
 
     pub fn operation_label(&self) -> &'static str {
-        match (self.read_bytes_interval > 0, self.write_bytes_interval > 0) {
+        match (self.cumulative_read > 0, self.cumulative_write > 0) {
             (true, true) => "r,w",
             (true, false) => "r",
             (false, true) => "w",
@@ -239,6 +239,11 @@ impl FileIoAccumulator {
             stats.read_bytes_interval = 0;
             stats.write_bytes_interval = 0;
         }
+    }
+
+    pub fn retain_recent(&mut self, now: Instant, retention: Duration) {
+        self.stats
+            .retain(|_, stats| now.duration_since(stats.last_io_at) < retention);
     }
 
     pub fn record_event(
@@ -293,13 +298,14 @@ impl FileIoAccumulator {
         let mut stats: Vec<_> = self
             .stats
             .values()
-            .filter(|stats| stats.pid == pid && stats.interval_total() > 0)
+            .filter(|stats| stats.pid == pid && stats.cumulative_total > 0)
             .collect();
 
         stats.sort_unstable_by(|left, right| {
             right
-                .interval_total()
-                .cmp(&left.interval_total())
+                .cumulative_total
+                .cmp(&left.cumulative_total)
+                .then_with(|| right.last_io_at.cmp(&left.last_io_at))
                 .then_with(|| left.fd.cmp(&right.fd))
                 .then_with(|| left.path.cmp(&right.path))
         });
@@ -339,10 +345,6 @@ fn collect_open_file_candidates(pid: u32, limit: usize) -> Vec<OpenFileCandidate
         else {
             continue;
         };
-        if fd <= 2 {
-            continue;
-        }
-
         files.push(OpenFileCandidate {
             fd,
             path: resolve_fd_path(pid, fd),
@@ -466,31 +468,60 @@ mod tests {
 
         accumulator.begin_interval();
 
-        assert!(accumulator.sorted_for_pid(10, 5).is_empty());
-        let stats = accumulator.stats.values().next().unwrap();
+        let visible = accumulator.sorted_for_pid(10, 5);
+        assert_eq!(visible.len(), 1);
+        let stats = visible[0];
+        assert_eq!(stats.interval_total(), 0);
         assert_eq!(stats.cumulative_total, 512);
+        assert_eq!(stats.operation_label(), "r");
     }
 
     #[test]
-    fn file_stats_are_sorted_by_interval_total_and_limited() {
+    fn file_stats_are_sorted_by_cumulative_total_and_limited() {
         let now = Instant::now();
         let mut accumulator = FileIoAccumulator::default();
         accumulator.record_event(
-            event(10, 3, IoOperation::Read, 100),
+            event(10, 3, IoOperation::Read, 1_000),
             99,
-            "/tmp/small".into(),
+            "/tmp/largest-cumulative".into(),
             now,
         );
         accumulator.record_event(
             event(10, 4, IoOperation::Write, 500),
             99,
-            "/tmp/large".into(),
+            "/tmp/smaller-cumulative".into(),
             now,
+        );
+        accumulator.begin_interval();
+        accumulator.record_event(
+            event(10, 4, IoOperation::Write, 100),
+            99,
+            "/tmp/smaller-cumulative".into(),
+            now + Duration::from_secs(1),
         );
 
         let stats = accumulator.sorted_for_pid(10, 1);
         assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].path, "/tmp/large");
+        assert_eq!(stats[0].path, "/tmp/largest-cumulative");
+        assert_eq!(stats[0].write_bytes_interval, 0);
+    }
+
+    #[test]
+    fn detail_retention_removes_stale_files() {
+        let now = Instant::now();
+        let mut accumulator = FileIoAccumulator::default();
+        accumulator.record_event(
+            event(10, 3, IoOperation::Read, 100),
+            99,
+            "/tmp/data".into(),
+            now,
+        );
+
+        accumulator.retain_recent(now + Duration::from_secs(299), Duration::from_secs(300));
+        assert_eq!(accumulator.sorted_for_pid(10, 5).len(), 1);
+
+        accumulator.retain_recent(now + Duration::from_secs(300), Duration::from_secs(300));
+        assert!(accumulator.sorted_for_pid(10, 5).is_empty());
     }
 
     #[test]
@@ -499,9 +530,12 @@ mod tests {
     }
 
     #[test]
-    fn fallback_candidates_exclude_standard_streams() {
+    fn fallback_candidates_include_standard_streams() {
         let files = collect_open_file_candidates(std::process::id(), usize::MAX);
-        assert!(files.iter().all(|file| file.fd > 2));
+
+        for fd in 0..=2 {
+            assert!(files.iter().any(|file| file.fd == fd), "missing fd {fd}");
+        }
     }
 
     #[test]

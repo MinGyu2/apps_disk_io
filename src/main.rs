@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RETAIN_EXITED_SECONDS: u64 = 30;
 const DEFAULT_DETAIL_LIMIT: usize = 5;
+const DEFAULT_DETAIL_RETAIN_SECONDS: u64 = 300;
 const MAX_PROCESSES: usize = 20;
 
 #[derive(Debug, Parser)]
@@ -38,13 +39,25 @@ struct Cli {
     )]
     retain_exited: u64,
 
-    /// 열린 파일 디스크립터 후보를 프로세스 아래에 표시
+    /// eBPF로 수집한 파일별 read/write I/O를 표시
     #[arg(long)]
     detail: bool,
+
+    /// detail 모드에서 열린 파일 디스크립터 목록도 표시
+    #[arg(long, requires = "detail")]
+    fd: bool,
 
     /// detail 모드에서 프로세스당 표시할 최대 파일 수
     #[arg(long, value_name = "COUNT", default_value_t = DEFAULT_DETAIL_LIMIT)]
     detail_limit: usize,
+
+    /// 마지막 I/O 후 파일별 통계를 유지할 시간(초)
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = DEFAULT_DETAIL_RETAIN_SECONDS
+    )]
+    detail_retain: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,21 +307,10 @@ fn format_bytes(bytes: u64) -> String {
 #[derive(Clone, Copy)]
 struct DetailRenderContext<'a> {
     accumulator: &'a detail::FileIoAccumulator,
-    fallback: &'a detail::FallbackDetails,
+    open_fds: Option<&'a detail::FallbackDetails>,
     event_source_error: Option<&'a str>,
     elapsed_seconds: f64,
     limit: usize,
-}
-
-impl DetailRenderContext<'_> {
-    fn uses_fallback(self, processes: &[&ProcessStats]) -> bool {
-        processes.is_empty()
-            || processes.iter().any(|process_stats| {
-                self.accumulator
-                    .sorted_for_pid(process_stats.pid, self.limit)
-                    .is_empty()
-            })
-    }
 }
 
 fn render<W: Write>(
@@ -326,15 +328,14 @@ fn render<W: Write>(
             interval.as_millis(),
             MAX_PROCESSES
         )?;
-        if details.uses_fallback(processes) {
+        if details.event_source_error.is_some() {
+            writeln!(
+                writer,
+                "detail event source: unavailable - try running with sudo"
+            )?;
+        }
+        if details.open_fds.is_some() {
             writeln!(writer, "{}", detail::FALLBACK_NOTICE)?;
-            if let Some(error) = details.event_source_error {
-                writeln!(
-                    writer,
-                    "detail event source unavailable: {}",
-                    sanitize_for_terminal(error)
-                )?;
-            }
         }
     } else {
         writeln!(
@@ -391,11 +392,19 @@ fn render_process_details<W: Write>(
         .accumulator
         .sorted_for_pid(process_stats.pid, details.limit);
 
+    writeln!(writer, "         io:")?;
     if file_stats.is_empty() {
-        render_fallback_details(writer, process_stats, details.fallback)
+        writeln!(writer, "         └─ no captured read/write events yet")?;
     } else {
-        render_file_io_details(writer, &file_stats, details.elapsed_seconds)
+        render_file_io_details(writer, &file_stats, details.elapsed_seconds)?;
     }
+
+    if let Some(open_fds) = details.open_fds {
+        writeln!(writer, "         open fds:")?;
+        render_open_fd_details(writer, process_stats, open_fds)?;
+    }
+
+    Ok(())
 }
 
 fn render_file_io_details<W: Write>(
@@ -423,13 +432,13 @@ fn format_file_io_detail(file: &detail::FileIoStats, elapsed_seconds: f64) -> St
     debug_assert!(elapsed_seconds > 0.0);
     let mut fields = vec![format!("{:<3}", file.operation_label())];
 
-    if file.read_bytes_interval > 0 {
+    if file.cumulative_read > 0 {
         fields.push(format!(
             "r: {}",
             format_bytes_per_sec(file.read_bytes_interval as f64 / elapsed_seconds)
         ));
     }
-    if file.write_bytes_interval > 0 {
+    if file.cumulative_write > 0 {
         fields.push(format!(
             "w: {}",
             format_bytes_per_sec(file.write_bytes_interval as f64 / elapsed_seconds)
@@ -446,7 +455,7 @@ fn format_file_io_detail(file: &detail::FileIoStats, elapsed_seconds: f64) -> St
     fields.join("   ")
 }
 
-fn render_fallback_details<W: Write>(
+fn render_open_fd_details<W: Write>(
     writer: &mut W,
     process_stats: &ProcessStats,
     details: &detail::FallbackDetails,
@@ -456,12 +465,12 @@ fn render_fallback_details<W: Write>(
     if process_stats.exited {
         return writeln!(
             writer,
-            "         └─ open-fd   file descriptors unavailable (process exited)"
+            "         └─ file descriptors unavailable (process exited)"
         );
     }
 
     let Some(files) = files.filter(|files| !files.is_empty()) else {
-        return writeln!(writer, "         └─ open-fd   no readable file descriptors");
+        return writeln!(writer, "         └─ no readable file descriptors");
     };
 
     for (index, file) in files.iter().enumerate() {
@@ -472,7 +481,7 @@ fn render_fallback_details<W: Write>(
         };
         writeln!(
             writer,
-            "         {branch} open-fd   fd={:<4} {}",
+            "         {branch} fd={:<4} {}",
             file.fd,
             sanitize_for_terminal(&file.path)
         )?;
@@ -498,7 +507,9 @@ fn run(
     interval: Duration,
     retain_exited: Duration,
     detail_enabled: bool,
+    show_open_fds: bool,
     detail_limit: usize,
+    detail_retention: Duration,
 ) -> io::Result<()> {
     let mut previous = collect_samples()?;
     let mut previous_sampled_at = Instant::now();
@@ -537,6 +548,9 @@ fn run(
         let current = collect_samples()?;
         let sampled_at = Instant::now();
         let elapsed_seconds = sampled_at.duration_since(previous_sampled_at).as_secs_f64();
+        if let Some(accumulator) = file_io_accumulator.as_mut() {
+            accumulator.retain_recent(sampled_at, detail_retention);
+        }
         calculate_rates(
             &previous,
             &current,
@@ -546,7 +560,7 @@ fn run(
             retain_exited,
         );
         let processes = stats_for_display(&stats);
-        let fallback_details = detail_enabled.then(|| {
+        let open_fds = show_open_fds.then(|| {
             detail::collect_fallback_details(
                 processes
                     .iter()
@@ -555,16 +569,15 @@ fn run(
                 detail_limit,
             )
         });
-        let details = match (&file_io_accumulator, &fallback_details) {
-            (Some(accumulator), Some(fallback)) => Some(DetailRenderContext {
+        let details = file_io_accumulator
+            .as_ref()
+            .map(|accumulator| DetailRenderContext {
                 accumulator,
-                fallback,
+                open_fds: open_fds.as_ref(),
                 event_source_error: event_source_error.as_deref(),
                 elapsed_seconds,
                 limit: detail_limit,
-            }),
-            _ => None,
-        };
+            });
 
         render(&mut output, &processes, interval, details)?;
 
@@ -577,8 +590,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let interval = Duration::from_millis(cli.interval);
     let retain_exited = Duration::from_secs(cli.retain_exited);
+    let detail_retention = Duration::from_secs(cli.detail_retain);
 
-    match run(interval, retain_exited, cli.detail, cli.detail_limit) {
+    match run(
+        interval,
+        retain_exited,
+        cli.detail,
+        cli.fd,
+        cli.detail_limit,
+        detail_retention,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
@@ -638,7 +659,6 @@ mod tests {
     }
 
     fn render_accumulated_file_io(accumulator: &detail::FileIoAccumulator) -> String {
-        let fallback = HashMap::new();
         let mut output = Vec::new();
 
         render_process_details(
@@ -646,7 +666,7 @@ mod tests {
             &process_stats(),
             DetailRenderContext {
                 accumulator,
-                fallback: &fallback,
+                open_fds: None,
                 event_source_error: None,
                 elapsed_seconds: 1.0,
                 limit: 5,
@@ -843,7 +863,31 @@ mod tests {
     }
 
     #[test]
-    fn actual_file_stats_are_rendered_instead_of_fallback_entries() {
+    fn retained_read_detail_shows_zero_current_rate() {
+        let file = file_stats(0, 0, 12 * 1024 * 1024, 0, "/tmp/read-data");
+
+        let output = format_file_io_detail(&file, 1.0);
+
+        assert!(output.starts_with("r"));
+        assert!(output.contains("r: 0 B/s"));
+        assert!(output.contains("cum r: 12.0 MB"));
+        assert!(!output.contains("w: "));
+    }
+
+    #[test]
+    fn retained_write_detail_shows_zero_current_rate() {
+        let file = file_stats(0, 0, 0, 8 * 1024 * 1024, "/tmp/write-data");
+
+        let output = format_file_io_detail(&file, 1.0);
+
+        assert!(output.starts_with("w"));
+        assert!(output.contains("w: 0 B/s"));
+        assert!(output.contains("cum w: 8.0 MB"));
+        assert!(!output.contains("r: "));
+    }
+
+    #[test]
+    fn detail_without_fd_does_not_render_open_fd_section() {
         let now = Instant::now();
         let mut accumulator = detail::FileIoAccumulator::default();
         accumulator.record_event(
@@ -858,13 +902,6 @@ mod tests {
             "/tmp/data".into(),
             now,
         );
-        let fallback = HashMap::from([(
-            10,
-            vec![detail::OpenFileCandidate {
-                fd: 4,
-                path: "/tmp/fallback".into(),
-            }],
-        )]);
         let mut output = Vec::new();
 
         render_process_details(
@@ -872,7 +909,7 @@ mod tests {
             &process_stats(),
             DetailRenderContext {
                 accumulator: &accumulator,
-                fallback: &fallback,
+                open_fds: None,
                 event_source_error: None,
                 elapsed_seconds: 1.0,
                 limit: 5,
@@ -881,10 +918,61 @@ mod tests {
         .unwrap();
 
         let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("io:"));
         assert!(output.contains("r: 1.0 KB/s"));
         assert!(output.contains("cum r: 1.0 KB"));
-        assert!(!output.contains("open-fd"));
-        assert!(!output.contains("/tmp/fallback"));
+        assert!(!output.contains("open fds:"));
+    }
+
+    #[test]
+    fn detail_with_fd_renders_io_and_open_fd_sections() {
+        let mut accumulator = detail::FileIoAccumulator::default();
+        accumulator.record_event(
+            detail::FileIoEvent {
+                pid: 10,
+                tid: 10,
+                fd: 4,
+                op: detail::IoOperation::Write as u8,
+                bytes: 1_024,
+            },
+            99,
+            "/tmp/output".into(),
+            Instant::now(),
+        );
+        let open_fds = HashMap::from([(
+            10,
+            vec![
+                detail::OpenFileCandidate {
+                    fd: 0,
+                    path: "/dev/pts/2".into(),
+                },
+                detail::OpenFileCandidate {
+                    fd: 4,
+                    path: "/tmp/output".into(),
+                },
+            ],
+        )]);
+        let mut output = Vec::new();
+
+        render_process_details(
+            &mut output,
+            &process_stats(),
+            DetailRenderContext {
+                accumulator: &accumulator,
+                open_fds: Some(&open_fds),
+                event_source_error: None,
+                elapsed_seconds: 1.0,
+                limit: 5,
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("io:"));
+        assert!(output.contains("w: 1.0 KB/s"));
+        assert!(output.contains("open fds:"));
+        assert!(output.contains("fd=0"));
+        assert!(output.contains("fd=4"));
     }
 
     #[test]
@@ -907,7 +995,7 @@ mod tests {
         assert!(output.contains("└─ w"));
         assert!(output.contains("w: 2.0 KB/s"));
         assert!(output.contains("cum w: 2.0 KB"));
-        assert!(!output.contains("open-fd"));
+        assert!(!output.contains("open fds:"));
     }
 
     #[test]
@@ -935,7 +1023,7 @@ mod tests {
         assert!(output.contains("└─ r,w"));
         assert!(output.contains("r: 1.0 KB/s"));
         assert!(output.contains("w: 2.0 KB/s"));
-        assert!(!output.contains("open-fd"));
+        assert!(!output.contains("open fds:"));
     }
 
     #[test]
@@ -949,10 +1037,10 @@ mod tests {
         )]);
         let mut output = Vec::new();
 
-        render_fallback_details(&mut output, &process_stats(), &fallback).unwrap();
+        render_open_fd_details(&mut output, &process_stats(), &fallback).unwrap();
 
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("open-fd   fd=3"));
+        assert!(output.contains("fd=3"));
         assert!(!output.contains("r: "));
         assert!(!output.contains("w: "));
         assert!(!output.contains("r,w"));
@@ -970,15 +1058,32 @@ mod tests {
         assert_eq!(cli.interval, 500);
         assert_eq!(cli.retain_exited, 60);
         assert!(!cli.detail);
+        assert!(!cli.fd);
         assert_eq!(cli.detail_limit, DEFAULT_DETAIL_LIMIT);
+        assert_eq!(cli.detail_retain, DEFAULT_DETAIL_RETAIN_SECONDS);
     }
 
     #[test]
     fn parses_detail_options() {
-        let cli =
-            Cli::try_parse_from(["apps_disk_io", "--detail", "--detail-limit", "10"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "apps_disk_io",
+            "--detail",
+            "--fd",
+            "--detail-limit",
+            "10",
+            "--detail-retain",
+            "600",
+        ])
+        .unwrap();
 
         assert!(cli.detail);
+        assert!(cli.fd);
         assert_eq!(cli.detail_limit, 10);
+        assert_eq!(cli.detail_retain, 600);
+    }
+
+    #[test]
+    fn fd_option_requires_detail() {
+        assert!(Cli::try_parse_from(["apps_disk_io", "--fd"]).is_err());
     }
 }
