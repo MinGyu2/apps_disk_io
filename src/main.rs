@@ -1,3 +1,5 @@
+pub mod detail;
+
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
@@ -9,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_RETAIN_EXITED_SECONDS: u64 = 30;
+const DEFAULT_DETAIL_LIMIT: usize = 5;
 const MAX_PROCESSES: usize = 20;
 
 #[derive(Debug, Parser)]
@@ -34,6 +37,14 @@ struct Cli {
         default_value_t = DEFAULT_RETAIN_EXITED_SECONDS
     )]
     retain_exited: u64,
+
+    /// 열린 파일 디스크립터 후보를 프로세스 아래에 표시
+    #[arg(long)]
+    detail: bool,
+
+    /// detail 모드에서 프로세스당 표시할 최대 파일 수
+    #[arg(long, value_name = "COUNT", default_value_t = DEFAULT_DETAIL_LIMIT)]
+    detail_limit: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,15 +295,26 @@ fn render<W: Write>(
     writer: &mut W,
     processes: &[&ProcessStats],
     interval: Duration,
+    details: Option<&detail::FallbackDetails>,
 ) -> io::Result<()> {
     // 화면을 지우고 커서를 왼쪽 위로 이동한다.
     write!(writer, "\x1b[2J\x1b[H")?;
-    writeln!(
-        writer,
-        "Process disk I/O (interval: {} ms, top {})",
-        interval.as_millis(),
-        MAX_PROCESSES
-    )?;
+    if details.is_some() {
+        writeln!(
+            writer,
+            "Process disk I/O (interval: {} ms, top {}, detail: on)",
+            interval.as_millis(),
+            MAX_PROCESSES
+        )?;
+        writeln!(writer, "{}", detail::FALLBACK_NOTICE)?;
+    } else {
+        writeln!(
+            writer,
+            "Process disk I/O (interval: {} ms, top {})",
+            interval.as_millis(),
+            MAX_PROCESSES
+        )?;
+    }
     writeln!(
         writer,
         "{:<8} {:<25} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
@@ -318,6 +340,10 @@ fn render<W: Write>(
             format_bytes(process_stats.cumulative_write),
             format_bytes(process_stats.cumulative_total),
         )?;
+
+        if let Some(details) = details {
+            render_fallback_details(writer, process_stats, details)?;
+        }
     }
 
     if processes.is_empty() {
@@ -327,7 +353,60 @@ fn render<W: Write>(
     writer.flush()
 }
 
-fn run(interval: Duration, retain_exited: Duration) -> io::Result<()> {
+fn render_fallback_details<W: Write>(
+    writer: &mut W,
+    process_stats: &ProcessStats,
+    details: &detail::FallbackDetails,
+) -> io::Result<()> {
+    let files = details.get(&process_stats.pid);
+
+    if process_stats.exited {
+        return writeln!(
+            writer,
+            "         └─ open   file descriptors unavailable (process exited)"
+        );
+    }
+
+    let Some(files) = files.filter(|files| !files.is_empty()) else {
+        return writeln!(writer, "         └─ open   no readable file descriptors");
+    };
+
+    for (index, file) in files.iter().enumerate() {
+        let branch = if index + 1 == files.len() {
+            "└─"
+        } else {
+            "├─"
+        };
+        writeln!(
+            writer,
+            "         {branch} open   fd={:<4} {}",
+            file.fd,
+            sanitize_for_terminal(&file.path)
+        )?;
+    }
+
+    Ok(())
+}
+
+fn sanitize_for_terminal(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn run(
+    interval: Duration,
+    retain_exited: Duration,
+    detail_enabled: bool,
+    detail_limit: usize,
+) -> io::Result<()> {
     let mut previous = collect_samples()?;
     let mut previous_sampled_at = Instant::now();
     let mut stats = HashMap::new();
@@ -349,8 +428,17 @@ fn run(interval: Duration, retain_exited: Duration) -> io::Result<()> {
             retain_exited,
         );
         let processes = stats_for_display(&stats);
+        let details = detail_enabled.then(|| {
+            detail::collect_fallback_details(
+                processes
+                    .iter()
+                    .filter(|process_stats| !process_stats.exited)
+                    .map(|process_stats| process_stats.pid),
+                detail_limit,
+            )
+        });
 
-        render(&mut output, &processes, interval)?;
+        render(&mut output, &processes, interval, details.as_ref())?;
 
         previous = current;
         previous_sampled_at = sampled_at;
@@ -362,7 +450,7 @@ fn main() -> ExitCode {
     let interval = Duration::from_millis(cli.interval);
     let retain_exited = Duration::from_secs(cli.retain_exited);
 
-    match run(interval, retain_exited) {
+    match run(interval, retain_exited, cli.detail, cli.detail_limit) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
@@ -557,5 +645,16 @@ mod tests {
 
         assert_eq!(cli.interval, 500);
         assert_eq!(cli.retain_exited, 60);
+        assert!(!cli.detail);
+        assert_eq!(cli.detail_limit, DEFAULT_DETAIL_LIMIT);
+    }
+
+    #[test]
+    fn parses_detail_options() {
+        let cli =
+            Cli::try_parse_from(["apps_disk_io", "--detail", "--detail-limit", "10"]).unwrap();
+
+        assert!(cli.detail);
+        assert_eq!(cli.detail_limit, 10);
     }
 }
